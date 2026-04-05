@@ -68,9 +68,9 @@ const ENEMY_TYPES = {
 
 const WAVE_CFG = {
   duration:         30,
-  spawnInterval:    2.0,
-  minSpawnInterval: 0.18,
-  spawnDecrease:    0.15,
+  spawnInterval:    1.1,
+  minSpawnInterval: 0.12,
+  spawnDecrease:    0.09,
   hpScale:          0.18,
   speedScale:       0.06,
 };
@@ -91,6 +91,10 @@ class ServerGameState {
     this.sharedExp     = 0;
     this.sharedLevel   = 1;
     this.sharedExpNext = 20;
+
+    // Pending exp orbs (id → {id,x,y,value}) — collected by players
+    this.serverOrbs  = new Map();
+    this.nextOrbId   = 1;
 
     // Upgrade-pause: count of players currently on upgrade screen
     this.playersUpgrading = 0;
@@ -120,6 +124,12 @@ class ServerGameState {
   // ============================================================
 
   _tick(dt) {
+    // Pause ALL simulation while any player is on the upgrade screen
+    if (this.playersUpgrading > 0) {
+      this._broadcastState(); // send frozen state so clients don't drift
+      return;
+    }
+
     // ---- Wave timer
     this.waveTimer += dt;
     if (this.waveTimer >= WAVE_CFG.duration) {
@@ -140,10 +150,11 @@ class ServerGameState {
         this.spawnTimer = this.spawnInterval;
         this._spawnEnemy();
         // Extra spawns scale with wave
-        if (this.wave >= 6) {
-          const extraChance = Math.min(0.75, 0.25 + (this.wave - 6) * 0.04);
+        if (this.wave >= 3) {
+          const extraChance = Math.min(0.85, 0.35 + (this.wave - 3) * 0.05);
           if (Math.random() < extraChance) this._spawnEnemy();
-          if (this.wave >= 15 && Math.random() < 0.30) this._spawnEnemy();
+          if (this.wave >= 8  && Math.random() < 0.50) this._spawnEnemy();
+          if (this.wave >= 15 && Math.random() < 0.40) this._spawnEnemy();
         }
       }
     }
@@ -355,16 +366,23 @@ class ServerGameState {
   }
 
   _onEnemyDeath(e) {
-    this.sharedExp += e.exp;
+    // Spawn a server-tracked orb; exp is only granted when a client collects it
+    const orbId = this.nextOrbId++;
+    this.serverOrbs.set(orbId, { id: orbId, x: e.x, y: e.y, value: e.exp });
+    io.to(this.room.code).emit('enemyDied', { id: e.id, exp: e.exp, orbId, x: e.x, y: e.y });
+  }
+
+  // Called when a client reports collecting an orb
+  _grantExp(value, orbId) {
+    this.sharedExp += value;
     let gained = 0;
     while (this.sharedExp >= this.sharedExpNext) {
-      this.sharedExp     -= this.sharedExpNext;
-      this.sharedExpNext  = Math.floor(this.sharedExpNext * 1.3);
+      this.sharedExp    -= this.sharedExpNext;
+      this.sharedExpNext = Math.floor(this.sharedExpNext * 1.3);
       this.sharedLevel++;
       gained++;
     }
     if (gained > 0) {
-      // Pause spawning — wait for both players to finish upgrading
       this.playersUpgrading = this.room.players.size;
       io.to(this.room.code).emit('levelUp', {
         level:   this.sharedLevel,
@@ -373,7 +391,13 @@ class ServerGameState {
         expNext: this.sharedExpNext,
       });
     }
-    io.to(this.room.code).emit('enemyDied', { id: e.id, exp: e.exp, x: e.x, y: e.y });
+    // Confirm collection to all clients with current exp state
+    io.to(this.room.code).emit('orbCollected', {
+      id:      orbId,
+      exp:     this.sharedExp,
+      expNext: this.sharedExpNext,
+      level:   this.sharedLevel,
+    });
   }
 
   // ============================================================
@@ -490,6 +514,17 @@ io.on('connection', socket => {
     const room = getRoomBySocket(socket.id);
     if (!room || !room.game) return;
     room.game.damageEnemy(data.id, data.damage);
+  });
+
+  // Client collected an exp orb — grant exp once (dedup by orb ID)
+  socket.on('orbCollected', data => {
+    const room = getRoomBySocket(socket.id);
+    if (!room || !room.game) return;
+    const g   = room.game;
+    const orb = g.serverOrbs.get(data.id);
+    if (!orb) return; // already collected or stale
+    g.serverOrbs.delete(data.id);
+    g._grantExp(orb.value, orb.id);
   });
 
   // Upgrade sync
