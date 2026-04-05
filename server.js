@@ -356,7 +356,8 @@ class ServerGameState {
   // ============================================================
 
   damageEnemy(id, amount) {
-    const e = this.enemies.find(e => e.id === id);
+    // Guard: only damage enemies still alive (prevents double-death from duplicate reports)
+    const e = this.enemies.find(e => e.id === id && e.hp > 0);
     if (!e) return;
     e.hp -= amount;
     if (e.hp <= 0) {
