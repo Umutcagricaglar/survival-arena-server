@@ -132,18 +132,26 @@ class ServerGameState {
       this._spawnEnemy();
     }
 
-    // Move enemies toward centroid of players
+    // Move enemies toward closest player
     const playerList = [...this.room.players.values()].filter(p => p.hp > 0);
     if (playerList.length > 0) {
-      const cx = playerList.reduce((s, p) => s + p.x, 0) / playerList.length;
-      const cy = playerList.reduce((s, p) => s + p.y, 0) / playerList.length;
-
       for (const e of this.enemies) {
-        const dx   = cx - e.x, dy = cy - e.y;
+        // Find closest player
+        let targetX = playerList[0].x, targetY = playerList[0].y;
+        let bestDist = Infinity;
+        for (const p of playerList) {
+          const d = Math.sqrt((p.x - e.x) ** 2 + (p.y - e.y) ** 2);
+          if (d < bestDist) { bestDist = d; targetX = p.x; targetY = p.y; }
+        }
+        const dx   = targetX - e.x, dy = targetY - e.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
         if (dist > 1) {
-          e.x += (dx / dist) * e.speed * dt;
-          e.y += (dy / dist) * e.speed * dt;
+          e.vx = (dx / dist) * e.speed;
+          e.vy = (dy / dist) * e.speed;
+          e.x += e.vx * dt;
+          e.y += e.vy * dt;
+        } else {
+          e.vx = 0; e.vy = 0;
         }
       }
     }
@@ -180,6 +188,7 @@ class ServerGameState {
       hp, maxHp: hp, speed: spd,
       damage: tpl.damage, exp: tpl.exp,
       radius: tpl.radius, color: tpl.color,
+      vx: 0, vy: 0,
     };
     this.enemies.push(enemy);
 
@@ -223,7 +232,7 @@ class ServerGameState {
 
   _broadcastState() {
     io.to(this.room.code).emit('gameStateSync', {
-      enemies:     this.enemies.map(e => ({ id: e.id, x: e.x, y: e.y, hp: e.hp })),
+      enemies:     this.enemies.map(e => ({ id: e.id, x: e.x, y: e.y, hp: e.hp, vx: e.vx || 0, vy: e.vy || 0 })),
       wave:        this.wave,
       sharedLevel: this.sharedLevel,
       sharedExp:   this.sharedExp,
@@ -244,6 +253,14 @@ io.on('connection', socket => {
   console.log(`[+] Connected: ${socket.id}`);
 
   // ---- Lobby ---------------------------------------------------
+
+  socket.on('setColor', data => {
+    const room = getRoomBySocket(socket.id);
+    if (!room) return;
+    const player = room.players.get(socket.id);
+    if (player) player.color = data.color;
+    socket.to(room.code).emit('playerColorChanged', { id: socket.id, color: data.color });
+  });
 
   socket.on('createRoom', () => {
     const room = getRoomBySocket(socket.id);
@@ -318,6 +335,29 @@ io.on('connection', socket => {
     const room = getRoomBySocket(socket.id);
     if (!room || !room.game) return;
     room.game.damageEnemy(data.id, data.damage);
+  });
+
+  // ---- Upgrade sync -------------------------------------------
+  // Client sends { upgradeId } when the player picks an upgrade.
+  // Server waits for all players to pick, then broadcasts 'upgradesDone'.
+  socket.on('upgradePicked', data => {
+    const room = getRoomBySocket(socket.id);
+    if (!room || !room.game) return;
+
+    if (!room.game.pendingUpgrades) room.game.pendingUpgrades = new Map();
+    room.game.pendingUpgrades.set(socket.id, data);
+
+    const playerCount = room.players.size;
+    if (room.game.pendingUpgrades.size >= playerCount) {
+      // All players have chosen — broadcast and clear
+      const choices = {};
+      for (const [id, d] of room.game.pendingUpgrades) choices[id] = d;
+      io.to(room.code).emit('upgradesDone', choices);
+      room.game.pendingUpgrades.clear();
+    } else {
+      // Notify others that this player is waiting
+      socket.to(room.code).emit('upgradeWaiting', { id: socket.id });
+    }
   });
 
   // ---- Disconnect ----------------------------------------------
